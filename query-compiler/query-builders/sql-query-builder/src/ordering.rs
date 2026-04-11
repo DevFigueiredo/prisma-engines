@@ -50,6 +50,7 @@ impl OrderByBuilder {
                     self.build_order_aggr_scalar(order_by, needs_reversed_order, ctx)
                 }
                 OrderBy::ToManyAggregation(order_by) => self.build_order_aggr_rel(order_by, needs_reversed_order, ctx),
+                OrderBy::ToManyField(order_by) => self.build_order_to_many_field(order_by, needs_reversed_order, ctx),
                 OrderBy::Relevance(order_by) => {
                     reachable_only_with_capability!(ConnectorCapability::NativeFullTextSearch);
                     self.build_order_relevance(order_by, needs_reversed_order, ctx)
@@ -143,6 +144,180 @@ impl OrderByBuilder {
             order_definition,
             joins,
         }
+    }
+
+    /// Orders by a specific scalar field on a to-many related model using a correlated subquery.
+    ///
+    /// Generated SQL:
+    /// ```sql
+    /// ORDER BY (
+    ///   SELECT <related_table>.<field> FROM <related_table>
+    ///   WHERE <related_table>.<fk> = <parent_table>.<pk>
+    ///   ORDER BY <related_table>.<field> {direction}
+    ///   LIMIT 1
+    /// ) {direction}
+    /// ```
+    fn build_order_to_many_field(
+        &mut self,
+        order_by: &OrderByToManyField,
+        needs_reversed_order: bool,
+        ctx: &Context<'_>,
+    ) -> OrderByDefinition {
+        let order: Option<Order> = Some(into_order(
+            &order_by.sort_order,
+            order_by.nulls_order.as_ref(),
+            needs_reversed_order,
+        ));
+
+        let (intermediary_joins, subquery) =
+            self.compute_subquery_for_to_many_field(order_by, needs_reversed_order, ctx);
+
+        let order_definition: OrderDefinition = (subquery.clone(), order);
+
+        OrderByDefinition {
+            order_column: subquery,
+            order_definition,
+            joins: intermediary_joins,
+        }
+    }
+
+    /// Builds the correlated subquery expression and any intermediary joins for a to-many field ordering.
+    fn compute_subquery_for_to_many_field(
+        &mut self,
+        order_by: &OrderByToManyField,
+        needs_reversed_order: bool,
+        ctx: &Context<'_>,
+    ) -> (Vec<AliasedJoin>, Expression<'static>) {
+        let intermediary_hops = order_by.intermediary_hops();
+        let to_many_hop = order_by.to_many_hop().as_relation_hop().unwrap();
+
+        // Build joins for all hops leading up to the to-many relation.
+        let mut intermediary_joins: Vec<AliasedJoin> = vec![];
+        let parent_alias = self.parent_alias.clone();
+        for (i, hop) in intermediary_hops.iter().enumerate() {
+            let previous_join = if i > 0 { intermediary_joins.get(i - 1) } else { None };
+            let previous_alias = previous_join.map(|j| j.alias.as_str()).or(parent_alias.as_deref());
+            let join = compute_one2m_join(hop.as_relation_hop().unwrap(), &self.join_prefix(), previous_alias, ctx);
+            intermediary_joins.push(join);
+        }
+
+        // The alias for the context table that the correlated subquery references.
+        let context_alias = intermediary_joins
+            .last()
+            .map(|j| j.alias.clone())
+            .or_else(|| self.parent_alias.clone());
+
+        let subquery = if to_many_hop.relation().is_many_to_many() {
+            self.build_m2m_correlated_subquery(to_many_hop, &order_by.field, &order_by.sort_order, order_by.nulls_order.as_ref(), needs_reversed_order, context_alias, ctx)
+        } else {
+            self.build_one2m_correlated_subquery(to_many_hop, &order_by.field, &order_by.sort_order, order_by.nulls_order.as_ref(), needs_reversed_order, context_alias, ctx)
+        };
+
+        (intermediary_joins, subquery)
+    }
+
+    /// Builds a correlated sub-SELECT for one-to-many relations:
+    /// `(SELECT field FROM Related WHERE Related.fk = Parent.pk ORDER BY field {dir} LIMIT 1)`
+    fn build_one2m_correlated_subquery(
+        &mut self,
+        rf: &RelationFieldRef,
+        field: &ScalarFieldRef,
+        sort_order: &SortOrder,
+        nulls_order: Option<&NullsOrder>,
+        needs_reversed_order: bool,
+        context_alias: Option<String>,
+        ctx: &Context<'_>,
+    ) -> Expression<'static> {
+        let (left_fields, right_fields) = if rf.is_inlined_on_enclosing_model() {
+            // FK is on the parent model side.
+            (rf.scalar_fields(), rf.referenced_fields())
+        } else {
+            // FK is on the related model side.
+            (
+                rf.related_field().referenced_fields(),
+                rf.related_field().scalar_fields(),
+            )
+        };
+
+        // WHERE right_field (on related table) = left_field (on parent, with alias if applicable)
+        let conditions: Vec<Expression<'static>> = left_fields
+            .iter()
+            .zip(right_fields.iter())
+            .map(|(left, right)| {
+                let parent_col = left.as_column(ctx).opt_table(context_alias.clone());
+                let related_col = right.as_column(ctx);
+                parent_col.equals(related_col).into()
+            })
+            .collect();
+
+        let field_col = field.as_column(ctx);
+        let inner_order = into_order(sort_order, nulls_order, needs_reversed_order);
+        let inner_order_def: OrderDefinition<'static> = (field_col.clone().into(), Some(inner_order));
+
+        let subquery = Select::from_table(rf.related_model().as_table(ctx))
+            .column(field_col)
+            .so_that(ConditionTree::And(conditions))
+            .order_by(inner_order_def)
+            .limit(1);
+
+        Expression::from(subquery)
+    }
+
+    /// Builds a correlated sub-SELECT for many-to-many relations (via junction table):
+    /// ```sql
+    /// (SELECT field FROM Related
+    ///  LEFT JOIN _Junction ON Related.id = _Junction.B
+    ///  WHERE _Junction.A = Parent.id
+    ///  ORDER BY field {dir}
+    ///  LIMIT 1)
+    /// ```
+    fn build_m2m_correlated_subquery(
+        &mut self,
+        rf: &RelationFieldRef,
+        field: &ScalarFieldRef,
+        sort_order: &SortOrder,
+        nulls_order: Option<&NullsOrder>,
+        needs_reversed_order: bool,
+        context_alias: Option<String>,
+        ctx: &Context<'_>,
+    ) -> Expression<'static> {
+        let m2m_table = rf.as_table(ctx);
+        // Column in junction that stores parent IDs (used in WHERE for correlation)
+        let m2m_parent_col = rf.related_field().m2m_column(ctx);
+        // Column in junction that stores child IDs (used in INNER JOIN condition)
+        let m2m_child_col = rf.m2m_column(ctx);
+        let child_model = rf.related_model();
+        let child_ids: ModelProjection = child_model.primary_identifier().into();
+        let parent_ids: ModelProjection = rf.model().primary_identifier().into();
+
+        // WHERE _Junction.parent_col = Parent.id (correlated)
+        let junction_conditions: Vec<Expression<'static>> = parent_ids
+            .scalar_fields()
+            .map(|sf| {
+                let parent_col = sf.as_column(ctx).opt_table(context_alias.clone());
+                let junction_col = m2m_parent_col.clone();
+                junction_col.equals(parent_col).into()
+            })
+            .collect();
+
+        // LEFT JOIN _Junction ON Related.id = _Junction.B
+        let left_join_conditions: Vec<Expression<'static>> = child_ids
+            .as_columns(ctx)
+            .map(|c| c.equals(m2m_child_col.clone()).into())
+            .collect();
+
+        let field_col = field.as_column(ctx);
+        let inner_order = into_order(sort_order, nulls_order, needs_reversed_order);
+        let inner_order_def: OrderDefinition<'static> = (field_col.clone().into(), Some(inner_order));
+
+        let subquery = Select::from_table(child_model.as_table(ctx))
+            .column(field_col)
+            .so_that(ConditionTree::And(junction_conditions))
+            .left_join(m2m_table.on(ConditionTree::And(left_join_conditions)))
+            .order_by(inner_order_def)
+            .limit(1);
+
+        Expression::from(subquery)
     }
 
     fn compute_joins_aggregation(

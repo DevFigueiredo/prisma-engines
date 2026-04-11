@@ -588,6 +588,8 @@ fn order_by_selection(rs: &RelationSelection) -> FieldSelection {
             // Select the linking fields of the first hop so that the outer select can perform a join to traverse the relation.
             // This is necessary because the order by is done on a different join. The following hops are handled by the order by builder.
             OrderBy::ToManyAggregation(x) => first_hop_linking_fields(x.intermediary_hops()),
+            // For to-many field ordering, the correlated subquery doesn't require additional selections.
+            OrderBy::ToManyField(_) => vec![],
             OrderBy::ScalarAggregation(x) => vec![x.field.clone()],
         })
         .collect();

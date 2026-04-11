@@ -79,6 +79,7 @@ impl ManyRecords {
                 }
                 OrderBy::ScalarAggregation(_) => unimplemented!(),
                 OrderBy::ToManyAggregation(_) => unimplemented!(),
+                OrderBy::ToManyField(_) => unimplemented!(),
                 OrderBy::Relevance(_) => unimplemented!(),
             });
 
